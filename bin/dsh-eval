@@ -1,0 +1,112 @@
+#!/bin/sh
+# dsh-eval — AI-side entry of the Emacs eval gateway.
+#
+# Evaluates freshly constructed elisp in the RUNNING Emacs (no restart) with
+# a permission gate on the Emacs side: read-only/safe forms run silently,
+# anything else pops a y/n confirmation in Emacs, `danger' forms (shell,
+# file deletion, kill-emacs, ...) always do.
+#
+# Usage:
+#   dsh-eval "(message \"hello %s\" buffer-file-name)"        # arg
+#   dsh-eval -f draft.el                                      # file
+#   echo '(setq foo 1)' | dsh-eval -t "set foo for testing"   # stdin
+#
+# Options:
+#   -t TEXT   purpose shown to the user in the confirmation prompt
+#   -s NAME   source label (default: ai)
+#   -f FILE   read code from FILE instead of args/stdin
+#
+# Exit codes: 0 ok · 3 denied (user said no / policy) · 4 error (transport,
+# elisp error, Emacs unreachable)
+set -u
+
+SPOOL="${DSH_EVAL_SPOOL:-$HOME/.emacs.d/dsh-eval}"
+SRC=ai
+TITLE=""
+CODE=""
+
+CLIENT="${DSH_EMACSCLIENT:-}"
+if [ -z "$CLIENT" ]; then
+  CLIENT="$(command -v emacsclient 2>/dev/null || true)"
+fi
+if [ -z "$CLIENT" ]; then
+  for c in /Applications/Emacs.app/Contents/MacOS/bin/emacsclient \
+           /opt/homebrew/bin/emacsclient /usr/local/bin/emacsclient \
+           /usr/bin/emacsclient; do
+    [ -x "$c" ] && CLIENT="$c" && break
+  done
+fi
+if [ -z "$CLIENT" ]; then
+  echo "error: emacsclient not found (set DSH_EMACSCLIENT)" >&2
+  exit 4
+fi
+
+while getopts "t:s:f:h" opt; do
+  case "$opt" in
+    t) TITLE="$OPTARG" ;;
+    s) SRC="$OPTARG" ;;
+    f) CODE="$(cat "$OPTARG")" ;;
+    h) sed -n '2,20p' "$0"; exit 0 ;;
+    *) exit 4 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ -z "$CODE" ] && [ $# -gt 0 ]; then
+  CODE="$*"
+fi
+if [ -z "$CODE" ]; then
+  CODE="$(cat)"
+fi
+if [ -z "$CODE" ]; then
+  echo "error: no elisp code given" >&2
+  exit 4
+fi
+
+mkdir -p "$SPOOL"
+ID="$$-$(date +%s 2>/dev/null || echo $RANDOM)"
+REQ="$SPOOL/req-$ID.el"
+RESP="$REQ.resp"
+
+{
+  printf ';;; dsh-eval-request\n'
+  printf ';;; meta: ((source . "%s") (purpose . "%s"))\n' \
+    "$(printf '%s' "$SRC" | sed 's/"/\\"/g')" \
+    "$(printf '%s' "$TITLE" | sed 's/"/\\"/g')"
+  printf '%s\n' "$CODE"
+} > "$REQ"
+
+# Escape the path for the elisp string literal.
+REQ_EL="$(printf '%s' "$REQ" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+
+OUT="$("$CLIENT" -e "(dsh-eval--handle-request \"$REQ_EL\")" 2>&1)"
+CLIENT_EXIT=$?
+
+# emacsclient exit 1 usually means no server in this Emacs.
+if [ $CLIENT_EXIT -ne 0 ]; then
+  echo "error: emacsclient failed (exit $CLIENT_EXIT): $OUT" >&2
+  echo "hint: is Emacs running with (require 'dsh-eval) and (dsh-eval-server-ensure)?" >&2
+  rm -f "$REQ"
+  exit 4
+fi
+
+if [ ! -f "$RESP" ]; then
+  echo "error: no response written by Emacs ($OUT)" >&2
+  echo "hint: is dsh-eval.el loaded in Emacs?  M-x load-file dsh-eval.el" >&2
+  rm -f "$REQ"
+  exit 4
+fi
+
+STATUS="$(head -n1 "$RESP" | cut -f1)"
+SUMMARY="$(head -n1 "$RESP" | cut -f2-)"
+if [ -n "$SUMMARY" ]; then
+  printf '%% %s\n' "$SUMMARY" >&2
+fi
+tail -n +2 "$RESP"
+
+rm -f "$REQ" "$RESP"
+case "$STATUS" in
+  ok)     exit 0 ;;
+  denied) exit 3 ;;
+  *)      exit 4 ;;
+esac
